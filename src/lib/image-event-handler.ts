@@ -46,9 +46,14 @@ export class ImageEventHandler {
       return true;
     }
 
-    // Check if it contains an img element as a child
-    const imgChild = element.querySelector('img');
-    return imgChild !== null;
+    // Check if it contains an img element as a child.
+    // To avoid false positives when clicking on large containers (e.g., Canvas view)
+    // that contain multiple unrelated image nodes, only treat the element as an
+    // image element if it contains exactly one <img>. An element with many images
+    // is a container, not an image-specific element, and the default Obsidian
+    // behavior (e.g., creating a Canvas note) should be preserved.
+    const allImgs = element.querySelectorAll('img');
+    return allImgs.length === 1;
   }
 
   /**

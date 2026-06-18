@@ -42,6 +42,21 @@ export default class DoubleClickImageOpenerPlugin extends Plugin {
     // Register event listeners for image double-click handling
     this.eventHandler.registerEventListeners();
 
+    this.addCommand({
+      id: 'rename-focused-image',
+      name: 'Rename focused image file',
+      checkCallback: (checking) => {
+        if (!this.eventHandler.getFocusedImageFile()) {
+          return false;
+        }
+
+        if (!checking) {
+          this.eventHandler.renameFocusedImage();
+        }
+        return true;
+      },
+    });
+
     // Add settings tab
     this.addSettingTab(new DoubleClickImageOpenerSettingTab(this.app, this));
 

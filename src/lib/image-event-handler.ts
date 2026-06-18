@@ -1,8 +1,18 @@
-import type { App } from 'obsidian';
+import type { App, KeymapEventHandler, TAbstractFile } from 'obsidian';
+import { normalizePath, TFile } from 'obsidian';
 import type DoubleClickImageOpenerPlugin from '../main';
+import { getFocusedCanvasImageFile } from './canvas-image';
 import * as ErrorHandler from './error-handler';
 import { PathResolver } from './path-resolver';
 import { openWithDefaultApp } from './system-launcher';
+
+interface FileManagerWithRenamePrompt {
+  promptForFileRename(file: TAbstractFile): Promise<void>;
+}
+
+interface VaultAdapterWithPath {
+  basePath?: string;
+}
 
 /**
  * Handles image-related DOM events and coordinates image opening functionality
@@ -10,6 +20,10 @@ import { openWithDefaultApp } from './system-launcher';
 export class ImageEventHandler {
   private pathResolver: PathResolver;
   private boundHandleDoubleClick: (event: MouseEvent) => void;
+  private boundHandleClick: (event: MouseEvent) => void;
+  private f2KeymapHandler: KeymapEventHandler | null = null;
+  private lastClickedImageEmbed: HTMLElement | null = null;
+  private lastClickedCanvasNodeId: string | null = null;
 
   /**
    * Creates a new ImageEventHandler instance
@@ -25,6 +39,154 @@ export class ImageEventHandler {
     this.boundHandleDoubleClick = (event: MouseEvent) => {
       void this.handleImageDoubleClick(event);
     };
+    this.boundHandleClick = (event: MouseEvent) => {
+      this.handleImageClick(event);
+    };
+  }
+
+  /**
+   * Returns the image file currently focused by click or embed selection
+   */
+  public getFocusedImageFile(): TFile | null {
+    const canvasFile = getFocusedCanvasImageFile(
+      this.plugin.app,
+      this.lastClickedCanvasNodeId,
+    );
+    if (canvasFile) {
+      return canvasFile;
+    }
+
+    const embed = this.findFocusedImageEmbed();
+    if (!embed) {
+      return null;
+    }
+
+    return this.resolveImageFile(embed);
+  }
+
+  /**
+   * Opens Obsidian's built-in rename dialog for the focused image file
+   */
+  public renameFocusedImage(): void {
+    const file = this.getFocusedImageFile();
+    if (!file) {
+      return;
+    }
+
+    void (
+      this.plugin.app.fileManager as unknown as FileManagerWithRenamePrompt
+    ).promptForFileRename(file);
+  }
+
+  private findFocusedImageEmbed(): HTMLElement | null {
+    const selectedEmbed = document.querySelector(
+      '.internal-embed.image-embed.is-selected, .internal-embed.image-embed.mod-selected',
+    );
+    if (selectedEmbed instanceof HTMLElement) {
+      return selectedEmbed;
+    }
+
+    if (this.lastClickedImageEmbed?.isConnected) {
+      return this.lastClickedImageEmbed;
+    }
+
+    return null;
+  }
+
+  private resolveImageFile(embed: HTMLElement): TFile | null {
+    const sourcePath = this.plugin.app.workspace.getActiveFile()?.path ?? '';
+    const rawPath = embed.getAttribute('src') || embed.getAttribute('alt');
+
+    if (rawPath) {
+      try {
+        const file = this.plugin.app.metadataCache.getFirstLinkpathDest(
+          decodeURIComponent(rawPath),
+          sourcePath,
+        );
+        if (file instanceof TFile) {
+          return file;
+        }
+      } catch {
+        // Fall through to URL-based resolution
+      }
+    }
+
+    const img = embed.querySelector('img');
+    if (img?.src) {
+      return this.getFileFromImageUrl(img.src);
+    }
+
+    return null;
+  }
+
+  private getFileFromImageUrl(src: string): TFile | null {
+    try {
+      const url = new URL(src);
+      if (url.protocol !== 'app:') {
+        return null;
+      }
+
+      const adapter = this.plugin.app.vault.adapter as VaultAdapterWithPath;
+      const adapterBasePath = adapter.basePath;
+      if (!adapterBasePath) {
+        return null;
+      }
+
+      const basePath = normalizePath(adapterBasePath).replace('file://', '');
+      const urlPath = decodeURI(url.pathname.replace('/_capacitor_file_', ''))
+        .split('/')
+        .filter((part) => part !== '')
+        .join('/');
+
+      if (!urlPath.startsWith(basePath)) {
+        return null;
+      }
+
+      const relativePath = urlPath.slice(basePath.length + 1);
+      return this.plugin.app.vault.getFileByPath(relativePath);
+    } catch {
+      return null;
+    }
+  }
+
+  private handleImageClick(event: MouseEvent): void {
+    const target = event.target as HTMLElement;
+    const canvasNode = target.closest('.canvas-node');
+
+    if (canvasNode instanceof HTMLElement) {
+      const nodeId = canvasNode.dataset.id;
+      if (nodeId) {
+        this.lastClickedCanvasNodeId = nodeId;
+        this.lastClickedImageEmbed = null;
+        return;
+      }
+    }
+
+    const embed = target.closest('.internal-embed.image-embed');
+
+    if (embed instanceof HTMLElement) {
+      this.lastClickedImageEmbed = embed;
+      this.lastClickedCanvasNodeId = null;
+      return;
+    }
+
+    if (
+      !target.closest('.canvas-node') &&
+      !target.closest('.internal-embed.image-embed')
+    ) {
+      this.lastClickedCanvasNodeId = null;
+      this.lastClickedImageEmbed = null;
+    }
+  }
+
+  private handleF2Key(event: KeyboardEvent): boolean {
+    if (!this.getFocusedImageFile()) {
+      return false;
+    }
+
+    event.preventDefault();
+    this.renameFocusedImage();
+    return true;
   }
 
   /**
@@ -376,6 +538,10 @@ export class ImageEventHandler {
     try {
       // Use event delegation on the document to catch all image double-clicks
       document.addEventListener('dblclick', this.boundHandleDoubleClick, true);
+      document.addEventListener('click', this.boundHandleClick, true);
+      this.f2KeymapHandler = this.plugin.app.scope.register([], 'F2', (event) =>
+        this.handleF2Key(event),
+      );
       if (this.plugin.settings.enableDebugLogging) {
         console.debug(
           '[Double-Click Image Opener] Event listeners registered successfully',
@@ -399,6 +565,11 @@ export class ImageEventHandler {
         this.boundHandleDoubleClick,
         true,
       );
+      document.removeEventListener('click', this.boundHandleClick, true);
+      if (this.f2KeymapHandler) {
+        this.plugin.app.scope.unregister(this.f2KeymapHandler);
+        this.f2KeymapHandler = null;
+      }
       if (this.plugin.settings.enableDebugLogging) {
         console.debug(
           '[Double-Click Image Opener] Event listeners unregistered successfully',
